@@ -136,4 +136,4 @@ Use this project for **offline analysis, self-study, or settings that explicitly
 
 ## Licensing
 
-TThe original source code is licensed under the MIT License. Stockfish and third-party Python dependencies retain their own licenses.
+The original source code is licensed under the MIT License. Stockfish and third-party Python dependencies retain their own licenses.
