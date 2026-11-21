@@ -136,4 +136,4 @@ Use this project for **offline analysis, self-study, or settings that explicitly
 
 ## Licensing
 
-The Stockfish binary is **not bundled**. Stockfish and Python dependencies have their own third-party licenses. **No license for this project's original source code has been selected in this repository**; add one explicitly if you intend to grant reuse permissions.
+TThe original source code is licensed under the MIT License. Stockfish and third-party Python dependencies retain their own licenses.
