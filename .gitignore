@@ -1,0 +1,44 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local configuration and environment files
+.env
+.env.*
+!.env.example
+*.log
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# Downloaded engine binaries (keep Stockfish separate)
+stockfish.exe
+stockfish-*.exe
+stockfish_*.exe
+stockfish/
+
+# Local run / debugging artifacts
+captures/
+debug_frames/
+local_results/
