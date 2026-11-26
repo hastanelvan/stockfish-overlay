@@ -1,7 +1,14 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import numpy as np
 import chess
-from tracker import BoardTracker
+import chess.svg
+from xml.etree import ElementTree as ET
+from PySide6.QtCore import QByteArray
+from PySide6.QtGui import QImage, QPainter
+from PySide6.QtSvg import QSvgRenderer
+from tracker import BoardTracker, CalibrationError
 
 
 def render(board, flipped=False, highlighted=()):
@@ -109,5 +116,130 @@ class RobustnessTests(unittest.TestCase):
         image=render(board)
         image[267:273,267:273]=25
         self.assertEqual(tracker.read(image),tracker.expected(board))
+
+
+def render_svg(board, flipped=False, lastmove=None, lichess_marks=()):
+    drawing = chess.svg.board(board, orientation=not flipped, coordinates=False,
+                              size=480, lastmove=lastmove,
+                              check=board.king(board.turn) if lichess_marks else None)
+    if lichess_marks:
+        svg = ET.fromstring(drawing)
+        ns = '{http://www.w3.org/2000/svg}'
+        # Chessground's check gradient reaches the farthest corner of the square.
+        gradient = svg.find(f".//{ns}radialGradient[@id='check_gradient']")
+        gradient.set('r', '70.71%')
+        for stop, offset in zip(gradient, ('0%', '25%', '89%')):
+            stop.set('offset', offset)
+        for square in lichess_marks:
+            square_rect = next(r for r in svg.findall(ns+'rect')
+                               if chess.square_name(square) in r.get('class', '').split())
+            x, y = float(square_rect.get('x')), float(square_rect.get('y'))
+            size = float(square_rect.get('width'))
+            if board.piece_at(square):
+                # Occupied capture targets get a translucent tint in the corners.
+                ring = ET.SubElement(svg.find(ns+'defs'), ns+'radialGradient',
+                                     {'id': 'dest-ring', 'r': '70.71%'})
+                for level, opacity in [('80%', '0'), ('80%', '.3')]:
+                    ET.SubElement(ring, ns+'stop', {'offset': level, 'stop-color': '#145500',
+                                                   'stop-opacity': opacity})
+                marker = ET.Element(ns+'rect', dict(square_rect.attrib, fill='url(#dest-ring)'))
+            else:
+                marker = ET.Element(ns+'circle', {'cx': str(x+size/2), 'cy': str(y+size/2),
+                    'r': str(size*.22/2**.5), 'fill': '#14551e', 'opacity': '.5'})
+            svg.insert(list(svg).index(square_rect)+1, marker)
+        drawing = ET.tostring(svg, encoding='unicode')
+    image = QImage(480, 480, QImage.Format.Format_RGB888)
+    with QPainter(image) as painter:
+        QSvgRenderer(QByteArray(drawing.encode())).render(painter)
+    return np.frombuffer(image.constBits(), np.uint8).reshape(480, 480, 3).copy()
+
+
+class ColdStartTests(unittest.TestCase):
+    def test_lichess_check_capture_ring_and_legal_dots(self):
+        for fen, marks in [
+            ('6rk/5p2/8/8/8/8/7R/K7 b - - 0 1', (chess.G7, chess.G6, chess.H2)),
+            ('k7/8/8/8/8/8/1r4R1/1K6 w - - 0 1', (chess.C1, chess.C2, chess.B2)),
+        ]:
+            board = chess.Board(fen)
+            self.assertTrue(board.is_check())
+            for flipped in (False, True):
+                image = render_svg(board, flipped, lichess_marks=marks)
+                tracker = BoardTracker(image, flipped)
+                self.assertEqual(tracker.board.board_fen(), board.board_fen())
+                self.assertEqual(tracker.board.turn, board.turn)
+                tracker.observe(image)
+                self.assertTrue(tracker.last_position_matches)
+
+    def test_unrecognized_foreground_is_still_rejected(self):
+        board = chess.Board('6rk/5p2/8/8/8/8/7R/K7 b - - 0 1')
+        image = render_svg(board, lichess_marks=(chess.G7, chess.H2))
+        # An unrelated, opaque centered rectangle occupies an empty square.
+        image[250:290, 250:290] = (200, 20, 30)
+        with self.assertRaises(CalibrationError):
+            BoardTracker(image)
+
+    def test_midgame_start_and_next_move_with_both_orientations(self):
+        for flipped in (False, True):
+            board = chess.Board()
+            for move in ('e2e4', 'e7e5', 'g1f3'):
+                board.push_uci(move)
+            tracker = BoardTracker(render_svg(board, flipped, board.peek()), flipped)
+            self.assertEqual(tracker.board.board_fen(), board.board_fen())
+            self.assertEqual(tracker.board.turn, chess.BLACK)
+            self.assertFalse(tracker.turn_assumed)
+            self.assertFalse(tracker.board.castling_rights)
+            board.push_uci('b8c6')
+            image = render_svg(board, flipped, board.peek())
+            self.assertIsNone(tracker.observe(image))
+            self.assertEqual(tracker.observe(image).moves, ['b8c6'])
+
+    def test_turn_from_check_or_next_observed_move(self):
+        checked = chess.Board('7k/8/8/8/8/8/7R/K7 b - - 0 1')
+        self.assertEqual(BoardTracker(render_svg(checked)).board.turn, chess.BLACK)
+        board = chess.Board('7k/8/8/8/7p/8/R7/K7 b - - 0 1')
+        tracker = BoardTracker(render_svg(board))
+        self.assertTrue(tracker.turn_assumed)
+        self.assertEqual(tracker.board.turn, chess.WHITE)
+        board.push_uci('h4h3')
+        tracker.observe(render_svg(board))
+        self.assertEqual(tracker.observe(render_svg(board)).moves, ['h4h3'])
+        self.assertEqual(tracker.board.fen(), board.fen())
+        self.assertFalse(tracker.turn_assumed)
+
+    def test_en_passant_from_highlighted_double_push(self):
+        board = chess.Board('7k/3p4/8/4P3/8/8/8/K7 b - - 0 1')
+        board.push_uci('d7d5')
+        tracker = BoardTracker(render_svg(board, lastmove=board.peek()))
+        self.assertEqual(tracker.board.turn, board.turn)
+        self.assertTrue(tracker.board.has_legal_en_passant())
+
+    def test_custom_profile_survives_restart(self):
+        board = chess.Board()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'theme.npz'
+            BoardTracker(render(board), profile_path=path)
+            board.push_uci('e2e4')
+            tracker = BoardTracker(render(board, flipped=True), True, turn=chess.BLACK,
+                                   castling='KQkq', profile_path=path)
+            self.assertEqual(tracker.board.fen(), board.fen())
+
+    def test_replacement_with_same_occupied_squares_is_detected(self):
+        board = chess.Board('7k/5np1/8/8/8/8/3BR3/K7 w - - 0 1')
+        tracker = BoardTracker(render_svg(board))
+        board.set_piece_at(chess.D2, chess.Piece(chess.ROOK, chess.WHITE))
+        board.set_piece_at(chess.E2, chess.Piece(chess.BISHOP, chess.WHITE))
+        image = render_svg(board)
+        for _ in range(5):
+            tracker.observe(image)
+        self.assertFalse(tracker.last_position_matches)
+        self.assertGreaterEqual(tracker.missed, 2)
+        self.assertEqual(tracker.resync(image).board_fen(), board.board_fen())
+        self.assertTrue(tracker.last_position_matches)
+
+    def test_rejects_invalid_or_unreadable_positions(self):
+        board = chess.Board()
+        board.remove_piece_at(chess.E1)
+        with self.assertRaises(CalibrationError):
+            BoardTracker(render_svg(board))
 
 if __name__=='__main__': unittest.main()

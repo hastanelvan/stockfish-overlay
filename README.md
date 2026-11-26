@@ -1,6 +1,6 @@
 # Stockfish Overlay — Visual Chessboard Tracking & Analysis
 
-A Python desktop prototype that detects a visible chessboard, follows moves from the standard starting position, and displays **up to three Stockfish move suggestions** as transparent, click-through arrows.
+A Python desktop prototype that reads a visible chess position, follows subsequent moves, and displays **up to three Stockfish suggestions** as transparent, click-through arrows. You can open an analysis board at the opening, middlegame, or endgame.
 
 Built as a hands-on project in **computer vision, state estimation, constraint-based inference, desktop UI development, and engine integration**. It is intended for personal chess study and engine-permitted practice—not for unauthorized assistance in live competitive games.
 
@@ -9,12 +9,11 @@ Built as a hands-on project in **computer vision, state estimation, constraint-b
 ## What it does
 
 - **Automatically locates an 8 × 8 board** on the primary monitor using image processing; no manual board-area selection is needed in automatic mode.
-- **Calibrates using the standard starting position** to learn visual characteristics of the current piece set.
+- **Recognizes the standard Cburnett 2D pieces used by Lichess** out of the box. For another 2D piece set, import a separate screenshot of its starting arrangement once. Your current game can stay on the move you want to study.
 - **Tracks positions through legal-move constraints**, with support for captures, castling, en passant, promotions, and recovery from some missed frames.
 - **Re-detects a board** if its window moves, is resized, or temporarily disappears; hides arrows while the board position is uncertain.
-- **Runs Stockfish via the UCI protocol** using `python-chess` and requests up to three ranked alternatives with `MultiPV`.
-- **Draws a non-interactive, translucent overlay**: green for the top suggestion; red for the second and third choices. These are *alternatives in the same position*, not a three-move sequence.
-- **Offers manual mid-game resynchronization** after a successful starting-position calibration, with explicit side-to-move and castling-rights inputs.
+- **Offers an Elo chooser and optional human-like moves.** Green shows the recommendation at the chosen settings. Red arrows show alternatives for the same turn.
+- **Reads the current position again** after a jump in the game or a sustained tracking mismatch. You can also request a fresh read and correct the side to move or castling rights.
 
 The recognition system uses **image-processing heuristics and position constraints**, not a trained neural-network model. Stockfish supplies the chess search and evaluation; this repository does **not** implement a new chess engine.
 
@@ -27,7 +26,7 @@ Primary-screen capture
 BoardLocator: locate / verify board geometry
         |
         v
-BoardTracker: segment 64 squares, compare visual features
+BoardTracker: recognize the visible pieces from built-in or saved templates
         |
         v
 Legal transition search (python-chess) + uncertainty checks
@@ -36,7 +35,7 @@ Legal transition search (python-chess) + uncertainty checks
 Verified board position (FEN)
         |
         v
-Stockfish UCI analysis (up to three MultiPV results)
+Stockfish UCI analysis at the selected strength and style
         |
         v
 PySide6 click-through arrow overlay
@@ -63,10 +62,14 @@ Download the Stockfish engine from [stockfishchess.org](https://stockfishchess.o
 3. Run **`install.bat`** to create `.venv` and install Python dependencies.
 4. Run **`run_auto.bat`** to launch the automatic tracker.
 5. In the app, click **Dosya seç** (Choose file) and select the local Stockfish `.exe`.
-6. Open a chessboard in its **standard initial position** and keep it fully visible on your primary display.
+6. Open the position you want to study and keep the whole board visible on your primary display.
 7. Set **Siyah taşlar altta** if Black is at the bottom, then click **Otomatik takibi başlat** (Start automatic tracking).
 
-The display includes a toggle for showing suggestions only on the bottom player's turn and a configurable per-position analysis time.
+If the app has difficulty reading a different piece set, expand **Konumu düzelt veya yeniden oku**, select **Taş teması için örnek resim seç…**, and import a separate screenshot of that set in its standard starting arrangement. A tight crop of the 8 × 8 board works well. The app saves the theme for future sessions.
+
+**Motor gücü** sets the target playing strength. For example, 2500 uses Stockfish's native Elo setting when the engine supports it. The 3500 option uses that target on engines that support it and full strength on engines with a lower limit. Stockfish 19's calibrated settings span 1320–3190 Elo. Actual playing strength also depends on analysis time and hardware. Enable **İnsana benzer hamleler** to favor natural moves such as castling, recapturing, or developing a piece when the engine rates them within 0.15 pawns of its selected move.
+
+When a game opens mid-position, last-move highlights or a king in check can reveal whose turn it is. If both turns are plausible, the app shows White as an assumption and can correct it on the next observed move. For an immediate correction, choose the side to move and click **Yeniden oku ve devam et**. The same panel accepts known castling rights such as `Kq`. You can also show suggestions only on the bottom player's turn and adjust the analysis time.
 
 ### Option B — command line
 
@@ -85,6 +88,7 @@ stockfish-overlay/
 ├── auto_app.py          # Main automatic-tracking UI and workflow
 ├── board_locator.py     # Board geometry detection and verification
 ├── tracker.py           # Screen-derived features and legal-move tracking
+├── piece_templates.py   # Built-in Cburnett references and screenshot import
 ├── app.py               # Stockfish integration, overlay, manual-mode UI
 ├── tests/               # Synthetic tracker / locator / UI / engine tests
 ├── requirements.txt     # Python dependencies
@@ -97,7 +101,7 @@ stockfish-overlay/
 
 ## Tests
 
-The repository includes **15 test functions**, covering synthetic-board tracking, capture sequences, board orientation, castling, en passant, promotion, board detection and recovery, as well as a UI-flow integration test.
+The tests cover synthetic board tracking, midgame recognition, reference import, capture sequences, board orientation, castling, en passant, promotion, board detection and recovery, engine strength and style, and the automatic UI flow.
 
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -114,11 +118,10 @@ Tests using that environment variable are skipped when it is absent. **The prese
 
 ## Known limitations
 
-- Initial calibration requires a **standard starting position**; arbitrary mid-game setup cannot be inferred reliably from a single screenshot. Mid-game resync requires prior calibration and manual entry of side to move and castling rights.
-- A screenshot alone cannot establish move history, castling rights, or en-passant rights. Resync resets move history and related state; it may be inaccurate immediately after a double pawn move.
-- Piece appearance and square colors are learned for the initial theme. Changing piece sets, themes, board orientation, or zoom may require restarting calibration.
+- An independently recognized midgame position has unknown move counts and repetition history. The tracker assumes no castling rights unless you supply them. It can recover an en-passant target from a recognizable last double-pawn push. Positions tracked continuously retain their move history.
+- A new piece theme can require a new reference image. Use the orientation setting to match the visible board.
 - Designed for **one large board on the primary monitor**. Multiple simultaneous boards, unusual 3D/textured styles, overlays, very small boards, and long animations can lead to false detection or loss of tracking.
-- Automatic catch-up is limited to short gaps (up to two plies in its legal-transition search); longer gaps may require resynchronization.
+- Legal-move catch-up covers up to two plies. After a longer jump the app attempts to identify the visible position again.
 - End-to-end reliability on different Windows machines and real chess interfaces has **not** been established. Particular cases such as **captures** should be validated on the target board theme before treating results as reliable.
 - Recognition uses heuristics, not machine learning; there are no training metrics or claims of model accuracy.
 
@@ -135,5 +138,7 @@ For implementation details and a reproducible validation checklist, see [TECHNIC
 Use this project for **offline analysis, self-study, or settings that explicitly allow engine assistance**. Do not use it to gain unauthorized assistance in rated, competitive, or otherwise restricted live games. Respect the rules of the chess platform or event.
 
 ## Licensing
+
+The Stockfish binary is **not bundled**.
 
 The original source code is licensed under the MIT License. Stockfish and third-party Python dependencies retain their own licenses.

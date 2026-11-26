@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from threading import Timer
 
 import chess
 import chess.engine
@@ -15,6 +16,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -27,6 +29,85 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class StrengthChooser(QComboBox):
+    def __init__(self):
+        super().__init__()
+        self.addItem("Tam güç", None)
+        for elo in [1320, *range(1400, 3200, 100), 3190]:
+            self.addItem(f"{elo} Elo", elo)
+        self.addItem("3500 Elo (desteklenmezse tam güç)", 3500)
+
+
+def strength_options(engine, elo):
+    options = engine.options
+    rating = options.get("UCI_Elo")
+    can_limit = rating is not None and "UCI_LimitStrength" in options
+    if elo is not None and can_limit and rating.min <= elo <= rating.max:
+        return {"UCI_LimitStrength": True, "UCI_Elo": elo}, f"{elo} Elo"
+    if elo not in (None, 3500):
+        if can_limit:
+            raise ValueError(f"Bu motor {rating.min}–{rating.max} Elo aralığını destekliyor.")
+        raise ValueError("Bu motor Elo ayarını desteklemiyor.")
+    full = {}
+    if "UCI_LimitStrength" in options:
+        full["UCI_LimitStrength"] = False
+    if "Skill Level" in options:
+        full["Skill Level"] = options["Skill Level"].max
+    label = "Tam güç"
+    if elo is not None:
+        if can_limit and elo > rating.max:
+            label = f"Tam güç (motorun Elo üst sınırı {rating.max})"
+        else:
+            label = f"Tam güç (motor {elo} Elo ayarını desteklemiyor)"
+    return full, label
+
+
+def last_capture(board):
+    if board.move_stack:
+        previous = board.copy(stack=1)
+        move = previous.pop()
+        if previous.is_capture(move):
+            return move
+    return None
+
+
+def natural_move_priority(board, move, last_move):
+    if board.is_castling(move):
+        return 4
+    if last_move is not None and move.to_square == last_move.to_square and board.is_capture(move):
+        return 3
+    home_rank = 0 if board.turn == chess.WHITE else 7
+    piece = board.piece_type_at(move.from_square)
+    if piece in (chess.KNIGHT, chess.BISHOP) and chess.square_rank(move.from_square) == home_rank:
+        if chess.square_rank(move.to_square) != home_rank:
+            return 2
+    if piece == chess.PAWN and move.to_square in (chess.D4, chess.E4, chess.D5, chess.E5):
+        return 1
+    return int(board.gives_check(move))
+
+
+def human_move(board, selected, scores, last_move=None):
+    """Break small evaluation ties around Stockfish's strength-adjusted choice."""
+    anchor_score = scores.get(selected)
+    if anchor_score is None or anchor_score.is_mate():
+        return selected
+    anchor = anchor_score.pov(board.turn).score()
+    preference = (natural_move_priority(board, selected, last_move), 0)
+    result = selected
+    for move, score in scores.items():
+        if score is None or score.is_mate():
+            continue
+        cp = score.pov(board.turn).score()
+        # Stay within 15 centipawns of the selected move, including at limited Elo.
+        # Preserve a non-losing evaluation and a clear (one-pawn) advantage.
+        if abs(cp - anchor) > 15 or (anchor >= 0 > cp) or (anchor >= 100 > cp):
+            continue
+        candidate = (natural_move_priority(board, move, last_move), -abs(cp - anchor))
+        if candidate > preference:
+            result, preference = move, candidate
+    return result
 
 
 class EngineSession:
@@ -56,9 +137,14 @@ class Analyzer(QThread):
     failure = Signal(str)
     variations = Signal(object)  # Ranked alternative root moves, not successive plies.
 
-    def __init__(self, fen: str, executable: str, seconds: float, session=None, multipv=1):
+    def __init__(self, fen: str, executable: str, seconds: float, session=None, multipv=1,
+                 elo=None, human_like=False, last_move=None):
         super().__init__()
         self.multipv = multipv
+        self.elo = elo
+        self.effective_strength_text = None
+        self.human_like = human_like
+        self.last_move = last_move
         self.session = session
         self.fen = fen
         self.executable = executable
@@ -72,26 +158,49 @@ class Analyzer(QThread):
                 self.failure.emit("Oyun bu konumda bitmiş; önerilecek hamle yok.")
                 return
             engine = self.session.get(self.executable) if self.session else chess.engine.SimpleEngine.popen_uci(self.executable, timeout=10.0)
-            infos = engine.analyse(position, chess.engine.Limit(time=self.seconds),
-                                   multipv=min(self.multipv, position.legal_moves.count()))
-            if isinstance(infos, dict):
-                infos = [infos]
-            results = []
-            for info in sorted(infos, key=lambda i: i.get('multipv', 1)):
+            legal_count = position.legal_moves.count()
+            count = min(self.multipv, legal_count)
+            options, strength_text = strength_options(engine, self.elo)
+            # Stockfish's strength limiter considers at least four candidates.
+            consider_alternatives = self.human_like or options.get("UCI_LimitStrength")
+            lines = min(legal_count, max(count, 4)) if consider_alternatives else count
+            with engine.analysis(position, chess.engine.Limit(time=self.seconds),
+                                 multipv=lines, options=options) as analysis:
+                self.effective_strength_text = strength_text
+                # wait() exposes the selected bestmove but has no built-in timeout.
+                timeout = Timer(self.seconds + 10.0, engine.close)
+                timeout.start()
+                try:
+                    selected = analysis.wait().move
+                    infos = analysis.multipv
+                finally:
+                    timeout.cancel()
+            if selected is None or selected not in position.legal_moves:
+                raise ValueError("Stockfish geçerli bir hamle döndürmedi.")
+
+            # At limited Elo the selected move can differ from the first PV.
+            # Keep the score attached to the move that actually received it.
+            scores = {}
+            for info in infos:
                 pv = info.get('pv') or []
-                if not pv or pv[0] not in position.legal_moves:
-                    continue
-                move = pv[0]
-                score = info.get('score')
+                if pv and pv[0] in position.legal_moves:
+                    if not info.get('lowerbound') and not info.get('upperbound'):
+                        scores[pv[0]] = info.get('score')
+                    else:
+                        scores.setdefault(pv[0], None)
+            if self.human_like:
+                selected = human_move(position, selected, scores, self.last_move)
+            results = []
+            for move in dict.fromkeys([selected, *scores]):
+                score = scores.get(move)
                 evaluation = 'Değerlendirme yok'
                 if score is not None:
                     mate = score.white().mate()
                     cp = score.white().score()
                     evaluation = f'Mat {mate:+d}' if mate is not None else f'{cp / 100:+.2f}' if cp is not None else evaluation
-                if not any(r['uci'] == move.uci() for r in results):
-                    results.append(dict(uci=move.uci(), san=position.san(move), score=evaluation))
-            if not results:
-                raise ValueError('Stockfish herhangi bir hamle döndürmedi.')
+                results.append(dict(uci=move.uci(), san=position.san(move), score=evaluation))
+                if len(results) == count:
+                    break
             self.variations.emit(results)
             first = results[0]
             self.success.emit(first['uci'], first['san'], first['score'])
@@ -288,10 +397,17 @@ class MainWindow(QMainWindow):
         self.seconds.setSingleStep(0.25)
         self.seconds.setValue(0.75)
         self.seconds.setSuffix(" saniye")
+        self.strength = StrengthChooser()
+        self.strength.currentIndexChanged.connect(self.strength_changed)
+        self.human_like = QCheckBox("İnsana benzer hamleler")
+        self.human_like.setToolTip("Yakın değerlendirmeli hamlelerde doğal gelişimi, roku ve geri almayı tercih eder.")
+        self.human_like.toggled.connect(self.strength_changed)
         self.flip = QCheckBox("Siyah taşlar altta (tahtayı çevir)")
         self.flip.toggled.connect(self.orientation_changed)
         settings = QFormLayout()
         settings.addRow("Analiz süresi:", self.seconds)
+        settings.addRow("Motor gücü:", self.strength)
+        settings.addRow(self.human_like)
         settings.addRow("Yön:", self.flip)
         layout.addLayout(settings)
 
@@ -306,6 +422,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(hide_button)
 
         self.best_move = None
+        self.last_capture_position = None
         self.uci_entry = QLineEdit()
         self.uci_entry.setPlaceholderText("Örn. e2e4 (hamleyi elle uygula)")
         apply_move = QPushButton("Hamleyi uygula")
@@ -334,6 +451,13 @@ class MainWindow(QMainWindow):
     def orientation_changed(self, checked):
         self.overlay.black_bottom = checked
         self.overlay.update()
+
+    def strength_changed(self):
+        if self.best_move:
+            self.best_move = None
+            self.overlay.set_move(None)
+            self.overlay.hide()
+            self.analyze()
 
     def choose_area(self):
         self.overlay.hide()
@@ -375,18 +499,27 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
         self.analyze_button.setEnabled(False)
+        self.strength.setEnabled(False)
+        self.human_like.setEnabled(False)
         self.status_label.setText("Stockfish analiz ediyor...")
-        self.worker = Analyzer(board.fen(), path, self.seconds.value())
+        fen = board.fen()
+        last_move = None
+        if self.last_capture_position and self.last_capture_position[0] == fen:
+            last_move = self.last_capture_position[1]
+        self.worker = Analyzer(fen, path, self.seconds.value(), elo=self.strength.currentData(),
+                               human_like=self.human_like.isChecked(), last_move=last_move)
         self.worker.success.connect(self.analysis_done)
         self.worker.failure.connect(self.analysis_failed)
         self.worker.finished.connect(lambda: self.analyze_button.setEnabled(True))
+        self.worker.finished.connect(lambda: self.strength.setEnabled(True))
+        self.worker.finished.connect(lambda: self.human_like.setEnabled(True))
         self.worker.start()
 
     def analysis_done(self, uci, san, score):
         self.best_move = uci
         self.overlay.set_move(uci)
         self.overlay.show()
-        self.status_label.setText(f"En iyi hamle: {san} ({uci}) | {score}")
+        self.status_label.setText(f"{self.worker.effective_strength_text} | Önerilen hamle: {san} ({uci}) | {score}")
 
     def analysis_failed(self, message):
         self.status_label.setText(f"Analiz hatası: {message}")
@@ -399,8 +532,11 @@ class MainWindow(QMainWindow):
             move = chess.Move.from_uci(self.uci_entry.text().strip().lower())
             if move not in board.legal_moves:
                 raise ValueError("Bu konum için yasal bir hamle değil.")
+            capture = board.is_capture(move)
             board.push(move)
-            self.fen_entry.setText(board.fen())
+            fen = board.fen()
+            self.last_capture_position = (fen, move) if capture else None
+            self.fen_entry.setText(fen)
             self.uci_entry.clear()
             self.overlay.set_move(None)
             self.overlay.hide()

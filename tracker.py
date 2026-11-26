@@ -1,12 +1,9 @@
-"""Screen-square occupancy recognition + legal-move tracking.
-
-Training-friendly MVP: calibrate ONCE with the board in the standard starting
-position. No FEN is entered by the user. A single screenshot cannot reveal
-castling/en-passant state, so all moves are tracked from the start of the game.
-"""
+"""Recognize the visible chess position and track subsequent legal moves."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import tempfile
 
 import chess
 import numpy as np
@@ -25,84 +22,129 @@ class Recognition:
 
 
 class BoardTracker:
-    def __init__(self, image: np.ndarray, black_bottom: bool = False):
+    def __init__(self, image: np.ndarray, black_bottom: bool = False, *, turn=None,
+                 castling=None, templates=None, profile_path=None):
         self.black_bottom = black_bottom
         self.board = chess.Board()
-        self.templates = {}
         self.streak = 0
-        self.last_candidate: tuple[bool, ...] | None = None
+        self.last_candidate = None
         self.missed = 0
-        self.scoring_threshold = 27.0
-        scores = self.scores(image)
-        self.empty_thresholds: dict[int, float] = {}
-        initial = self.expected(self.board)
-        for color in (0, 1):
-            occupied = [x for i, x in enumerate(scores) if initial[i] and self.color(i) == color]
-            empty = [x for i, x in enumerate(scores) if not initial[i] and self.color(i) == color]
-            highest_empty, lowest_piece = max(empty), min(occupied)
-            if lowest_piece - highest_empty < 0.016:
-                raise CalibrationError(
-                    'Tahta okunamadı. Başlangıç konumunu açıp kareleri tam seç. '
-                    f'{"Açık" if color else "Koyu"} karelerde taş/zemin ayrımı düşük '
-                    f'({lowest_piece:.3f} / {highest_empty:.3f}).'
-                )
-            self.empty_thresholds[color] = (highest_empty + lowest_piece) / 2
-        features = self.features(image)
-        for i in range(64):
-            piece = self.board.piece_at(self.square_at(i))
-            if piece:
-                self.templates.setdefault(piece.symbol(), []).append(features[i])
-        self.resync_ready = False
+        self.turn_assumed = False
         self.transition_cache = {}
-        if self.read(image) != initial:
-            raise CalibrationError('İlk görüntü standart başlangıç dizilişiyle eşleşmiyor.')
+        self.last_position_matches = False
+        features = self.features(image)
+        from piece_templates import template_sets
+        saved = self.load_profile(profile_path)
+        banks = (templates,) if templates is not None else template_sets(self.features)
+        if saved:
+            banks = (saved, *banks)
+        matches = []
+        last_error = None
+        for bank in banks:
+            self._set_templates(bank)
+            try:
+                placement, error = self._read_placement(features)
+                matches.append((error, placement, bank))
+            except CalibrationError as exc:
+                last_error = exc
+        if matches:
+            _, placement, bank = min(matches, key=lambda m: m[0])
+            self._set_templates(bank)
+        else:
+            bank = self._learn_start(features, black_bottom)
+            if bank is None:
+                raise CalibrationError(str(last_error or 'Taş teması tanınamadı.'))
+            self._set_templates(bank)
+            placement = chess.Board()
+            try:
+                self.save_profile(profile_path, bank)
+            except OSError:
+                pass  # Continue tracking the current game if the cache is read-only.
+        self._adopt(placement, image, turn, castling)
+
+    def _set_templates(self, bank):
+        self.templates = bank
+        self._cached_features = None
+        self.__dict__.pop('_template_vectors', None)
 
     @staticmethod
-    def color(index: int) -> int:
-        row, col = divmod(index, 8)
-        return (row + col + 1) % 2  # a8 = light; 0=dark, 1=light
+    def load_profile(path):
+        if path is None:
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                symbols = 'pnbrqkPNBRQK'
+                if set(data.files) != set(symbols):
+                    return None
+                bank = {s: data[s] for s in symbols}
+                if all(a.ndim == 4 and 1 <= len(a) <= 8 and a.shape[1:] == (24, 24, 2)
+                       and np.isfinite(a).all() for a in bank.values()):
+                    return bank
+        except (OSError, ValueError, EOFError):
+            pass
+        return None
 
     @staticmethod
-    def scores(image: np.ndarray) -> np.ndarray:
-        if image.ndim != 3 or image.shape[2] < 3:
-            raise CalibrationError('Ekran görüntüsü RGB olmalı.')
-        h, w = image.shape[:2]
-        if min(h, w) < 160:
-            raise CalibrationError('Tahta görüntüsü çok küçük.')
-        if abs(w - h) > max(w, h) * 0.10:
-            raise CalibrationError('Seçilen tahta kare olmalı; kenardaki koordinatları dahil etme.')
-        pixels = image[:, :, :3].astype(np.float32)
-        result = []
-        for row in range(8):
-            for col in range(8):
-                y0 = round(row * h / 8)
-                y1 = round((row + 1) * h / 8)
-                x0 = round(col * w / 8)
-                x1 = round((col + 1) * w / 8)
-                tile = pixels[y0:y1, x0:x1]
-                th, tw = tile.shape[:2]
-                edge = max(2, int(min(th, tw) * 0.08))
-                corners = np.concatenate(
-                    [tile[:edge, :edge].reshape(-1, 3),
-                     tile[:edge, -edge:].reshape(-1, 3),
-                     tile[-edge:, :edge].reshape(-1, 3),
-                     tile[-edge:, -edge:].reshape(-1, 3)], axis=0
-                )
-                background = np.median(corners, axis=0)
-                margin_y, margin_x = max(1, round(th * .13)), max(1, round(tw * .13))
-                core = tile[margin_y:th-margin_y, margin_x:tw-margin_x]
-                deviation = np.max(np.abs(core - background), axis=2)
-                # Fraction of central pixels visibly different from the tile color.
-                score = float(np.mean(deviation > 27))
-                result.append(score)
-        return np.array(result, dtype=float)
+    def save_profile(path, bank):
+        if path is None:
+            return
+        path = Path(path)
+        temporary = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
+                temporary = Path(f.name)
+                np.savez_compressed(f, **{s: np.asarray(items, dtype=np.float32)
+                                         for s, items in bank.items()})
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
-    def square_at(self, index: int) -> chess.Square:
+    @classmethod
+    def learn_reference(cls, image, black_bottom=False):
+        """Learn a custom theme from an explicitly supplied starting-board image."""
+        bank = cls._learn_start(cls.features(image), black_bottom)
+        if bank is None:
+            raise CalibrationError('Örnek görüntüdeki taşlar seçilen yön ve başlangıç dizilişiyle eşleşmedi.')
+        return bank
+
+    @classmethod
+    def _learn_start(cls, features, black_bottom):
+        # Unknown themes can be learned from an intact starting formation.
+        # Require the pawn rows, repeated back-rank pieces and colors to agree.
+        standard = chess.Board()
+        bank = {}
+        for i, feature in enumerate(features):
+            square = cls._image_square(i, black_bottom)
+            piece = standard.piece_at(square)
+            if bool(piece) != bool(feature[:, :, 0].mean() > .06):
+                return None
+            if piece:
+                bank.setdefault(piece.symbol(), []).append(feature)
+        if np.mean([cls.brightness(f) for f in bank['P']]) <= np.mean([cls.brightness(f) for f in bank['p']]):
+            return None
+        for symbol, samples in bank.items():
+            rivals = [f for other, items in bank.items() if other != symbol for f in items]
+            for n, feature in enumerate(samples):
+                other_type = min(cls.distance(feature, rival) for rival in rivals)
+                if other_type < .0015:
+                    return None
+                if len(samples) > 1:
+                    own_type = min(cls.distance(feature, other) for j, other in enumerate(samples) if j != n)
+                    if own_type > other_type + .001:
+                        return None
+        return bank
+
+    @staticmethod
+    def _image_square(index, black_bottom):
         row, col = divmod(index, 8)
-        if self.black_bottom:
+        if black_bottom:
             return chess.square(7 - col, row)
         return chess.square(col, 7 - row)
 
+    def square_at(self, index: int) -> chess.Square:
+        return self._image_square(index, self.black_bottom)
     def expected(self, board: chess.Board) -> tuple[bool, ...]:
         return tuple(board.piece_at(self.square_at(i)) is not None for i in range(64))
 
@@ -150,14 +192,41 @@ class BoardTracker:
         color = (cls.brightness(feature)-cls.brightness(template))**2
         return .60*silhouette + .25*intensity + .35*color
 
-    def ranked_pieces(self, feature):
-        return sorted((min(self.distance(feature,t) for t in samples),symbol)
-                      for symbol,samples in self.templates.items())
+    @staticmethod
+    def _foreground(tile, background, edge):
+        h, w = tile.shape[:2]
+        # A capture destination tints only the four corners. Recover the base
+        # from the edge midpoints when the two colors fit Chessground's overlay.
+        mid_y, mid_x = h // 2, w // 2
+        sides = [tile[:edge, mid_x-edge:mid_x+edge], tile[-edge:, mid_x-edge:mid_x+edge],
+                 tile[mid_y-edge:mid_y+edge, :edge], tile[mid_y-edge:mid_y+edge, -edge:]]
+        side = np.median(np.concatenate([s.reshape(-1, 3) for s in sides]), axis=0)
+        if np.max(np.abs(side-background)) > 15:
+            for tint, opacity in ((np.array([20,85,0]), .3), (np.array([20,30,85]), .2)):
+                if np.max(np.abs(side*(1-opacity) + tint*opacity - background)) < 9:
+                    background = side
+                    break
+
+        mask = np.max(np.abs(tile-background), axis=2) > 27
+        # A red check halo extends past both sides of the king. Remove red
+        # background pixels only on tiles with this symmetric color signature.
+        red = ((tile[:,:,0] - tile[:,:,1] > max(18, background[0]-background[1]+12))
+               & (tile[:,:,1] < background[1]-6) & (tile[:,:,2] < background[2]-6))
+        band = red[round(.42*h):round(.58*h)]
+        if (band[:,round(.02*w):round(.08*w)].mean() > .65 and
+                band[:,round(.92*w):round(.98*w)].mean() > .65):
+            mask &= ~red
+
+        return mask.astype(np.uint8), background
 
     @staticmethod
     def features(image):
         """Background-independent silhouettes and foreground brightness, 24x24."""
+        if image.ndim != 3 or image.shape[2] < 3:
+            raise CalibrationError('Ekran görüntüsü RGB olmalı.')
         h, w = image.shape[:2]
+        if min(h, w) < 160 or abs(w - h) > max(w, h) * .10:
+            raise CalibrationError('Tahta görüntüsü kare olmalı ve en az 160 piksel olmalı.')
         features = []
         for row in range(8):
             for col in range(8):
@@ -169,16 +238,26 @@ class BoardTracker:
                     tile[:edge,-edge:].reshape(-1,3), tile[-edge:,:edge].reshape(-1,3),
                     tile[-edge:,-edge:].reshape(-1,3)])
                 background = np.median(corners, axis=0)
-                # Remove tiny isolated decorations (coordinates, legal-move dots).
-                deviation = np.max(np.abs(tile-background),axis=2)
-                mask_full = (deviation > 27).astype(np.uint8)
+                mask_full, background = BoardTracker._foreground(tile, background, edge)
                 margin_y, margin_x = max(2,round(th*.12)), max(2,round(tw*.12))
                 mask_full[:margin_y] = mask_full[-margin_y:] = 0
                 mask_full[:,:margin_x] = mask_full[:,-margin_x:] = 0
-                n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_full, connectivity=8)
+                n, labels, stats, centers = cv2.connectedComponentsWithStats(mask_full, connectivity=8)
                 keep = np.zeros(n, dtype=np.uint8)
                 for label in range(1,n):
-                    keep[label] = stats[label,cv2.CC_STAT_AREA] >= th*tw*.012
+                    _, _, width, height, area = stats[label]
+                    if area < th*tw*.012:
+                        continue
+                    cx, cy = centers[label]
+                    if (abs(cx/tw-.5) < .04 and abs(cy/th-.5) < .04
+                            and .24 <= width/tw <= .35 and .24 <= height/th <= .35
+                            and .68 <= area/(width*height) <= .88):
+                        # Chessground legal (green) and premove (blue) dots.
+                        center = tile[round(cy), round(cx)]
+                        if any(np.max(np.abs(center-(background+tint)*.5)) < 10
+                               for tint in (np.array([20,85,30]), np.array([20,30,85]))):
+                            continue
+                    keep[label] = 1
                 mask_full = keep[labels].astype(float)
                 mask = cv2.resize(mask_full,(24,24),interpolation=cv2.INTER_AREA)
                 brightness = cv2.resize(mask_full*tile.mean(axis=2)/255,(24,24),interpolation=cv2.INTER_AREA)
@@ -193,9 +272,10 @@ class BoardTracker:
             total += float(costs[piece.symbol()][i]) if piece else float(np.mean(feature**2))
         return total
 
-    def _matching_transitions(self, occupancy, depth):
+    def _matching_transitions(self, occupancy, depth, turn):
         # Reuse transitions while animations produce different intermediate frames.
-        if depth not in self.transition_cache:
+        key = (depth, turn)
+        if key not in self.transition_cache:
             indexed = {}
             def walk(board, moves, remaining):
                 if remaining == 0:
@@ -205,26 +285,31 @@ class BoardTracker:
                     board.push(move)
                     walk(board, moves + [move], remaining - 1)
                     board.pop()
-            walk(self.board.copy(), [], depth)
-            self.transition_cache[depth] = indexed
+            base = self.board.copy()
+            base.turn = turn
+            walk(base, [], depth)
+            self.transition_cache[key] = indexed
         result = []
         mask = sum(chess.BB_SQUARES[self.square_at(i)] for i, occupied in enumerate(occupancy) if occupied)
-        for moves in self.transition_cache[depth].get(mask, []):
+        for moves in self.transition_cache[key].get(mask, []):
             board = self.board.copy()
+            board.turn = turn
             for move in moves:
                 board.push(move)
             result.append((moves, board))
         return result
 
-    def resync(self, image, turn, castling='-'):
-        """Rebuild from learned piece templates; hidden chess state is explicit."""
-        features = self.features(image)
+    def _read_placement(self, features):
         occupancy = self.occupancy(features)
+        costs = self.costs(features)
         board = chess.Board(None)
+        errors = []
         for i, occupied in enumerate(occupancy):
             if not occupied:
+                if features[i][:,:,0].mean() > .08:
+                    raise CalibrationError(f'{chess.square_name(self.square_at(i))}: taş veya işaret net okunamadı.')
                 continue
-            ranked = self.ranked_pieces(features[i])
+            ranked = sorted((values[i], symbol) for symbol, values in costs.items())
             own_color = ranked[0][1].isupper()
             opposite = min(error for error,symbol in ranked if symbol.isupper() != own_color)
             if opposite - ranked[0][0] < .012:
@@ -232,19 +317,113 @@ class BoardTracker:
             if ranked[0][0] > .07 or ranked[1][0] - ranked[0][0] < .0015:
                 raise CalibrationError(f'{chess.square_name(self.square_at(i))}: taş net tanınamadı; yeniden okut.')
             board.set_piece_at(self.square_at(i), chess.Piece.from_symbol(ranked[0][1]))
-        board.turn = turn
+            errors.append(ranked[0][0])
+        for turn in (chess.WHITE, chess.BLACK):
+            board.turn = turn
+            if board.is_valid():
+                return board, float(np.mean(errors))
+        raise CalibrationError('Tanınan konum geçerli değil. Tahta yönünü ve taş temasını kontrol et.')
+
+    def _highlighted_move(self, image, board):
+        """Read a plausible last move from two distinctly recolored squares."""
+        h, w = image.shape[:2]
+        backgrounds = []
+        for row in range(8):
+            for col in range(8):
+                tile = image[round(row*h/8):round((row+1)*h/8),
+                             round(col*w/8):round((col+1)*w/8), :3]
+                n = max(2, round(min(tile.shape[:2]) * .08))
+                corners = [tile[:n,:n], tile[-n:,:n], tile[:n,-n:], tile[-n:,-n:]]
+                backgrounds.append(np.median(np.concatenate(corners).reshape(-1,3), axis=0))
+        backgrounds = np.asarray(backgrounds)
+        parity = np.indices((8,8)).sum(axis=0).ravel() % 2
+        colors = np.stack([np.median(backgrounds[parity == i], axis=0) for i in (0, 1)])
+        marked = np.flatnonzero(np.abs(backgrounds - colors[parity]).max(axis=1) > 24)
+        if len(marked) != 2:
+            return None
+        source, target = [self.square_at(i) for i in marked]
+        if board.piece_at(source):
+            source, target = target, source
+        piece = board.piece_at(target)
+        if board.piece_at(source) or not piece:
+            return None
+        before = board.copy(stack=False)
+        before.turn = piece.color
+        before.remove_piece_at(target)
+        before.set_piece_at(source, piece)
+        move = chess.Move(source, target)
+        home_rank = 0 if piece.color else 7
+        if (piece.piece_type == chess.KING and source == chess.square(4, home_rank)
+                and target in (chess.square(2, home_rank), chess.square(6, home_rank))):
+            kingside = chess.square_file(target) == 6
+            rook_home = chess.square(7 if kingside else 0, home_rank)
+            rook_target = chess.square(5 if kingside else 3, home_rank)
+            rook = chess.Piece(chess.ROOK, piece.color)
+            if before.piece_at(rook_home) is None and before.piece_at(rook_target) == rook:
+                before.remove_piece_at(rook_target)
+                before.set_piece_at(rook_home, rook)
+                before.castling_rights = chess.BB_SQUARES[rook_home]
+        if before.is_valid() and before.is_legal(move):
+            return move
+        # A capture can have blocked a check in the prior position.
+        before.set_piece_at(target, chess.Piece(chess.KNIGHT, not piece.color))
+        if before.is_valid() and before.is_legal(move):
+            return move
+        if (chess.square_rank(target) == 7 - home_rank and piece.piece_type in
+                (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)):
+            move = chess.Move(source, target, promotion=piece.piece_type)
+            before.set_piece_at(source, chess.Piece(chess.PAWN, piece.color))
+            if chess.square_file(source) == chess.square_file(target):
+                before.remove_piece_at(target)
+            if before.is_valid() and before.is_legal(move):
+                return move
+        return None
+
+    def _adopt(self, board, image, turn, castling):
+        standard = board.board_fen() == chess.STARTING_BOARD_FEN
+        if castling is None:
+            castling = 'KQkq' if standard else '-'
+        board.ep_square = None
         try:
             board.set_castling_fen(castling)
         except ValueError as exc:
             raise CalibrationError('Rok hakları KQkq veya - olmalı.') from exc
+        last_move = self._highlighted_move(image, board)
+        last_piece = board.piece_at(last_move.to_square) if last_move else None
+        assumed = False
+        if turn is None:
+            valid = []
+            for color in (chess.WHITE, chess.BLACK):
+                board.turn = color
+                if board.is_valid():
+                    valid.append(color)
+            if len(valid) == 1:
+                turn = valid[0]
+            elif last_piece:
+                turn = not last_piece.color
+            else:
+                turn = chess.WHITE
+                assumed = not standard
+        board.turn = turn
+        if (last_piece and last_piece.color != turn and last_piece.piece_type == chess.PAWN
+                and abs(last_move.from_square - last_move.to_square) == 16):
+            board.ep_square = (last_move.from_square + last_move.to_square) // 2
         if not board.is_valid():
             raise CalibrationError('Tanınan konum geçerli değil. Hamle sırasını ve görüntüyü kontrol et.')
         self.board = board
-        self.last_observed = occupancy
+        self.turn_assumed = assumed
+        self.last_observed = self.expected(board)
+        self.last_position_matches = True
+        self.missed = 0
         self.transition_cache.clear()
         self.streak = 0
         self.last_candidate = None
         return board.copy()
+
+    def resync(self, image, turn=None, castling=None):
+        """Rebuild from visible pieces and any available last-move evidence."""
+        board, _ = self._read_placement(self.features(image))
+        return self._adopt(board, image, turn, castling)
 
     def observe(self, image: np.ndarray) -> Recognition | None:
         """Return Recognition only when a *new* stable legal position is observed.
@@ -255,14 +434,32 @@ class BoardTracker:
         features = self.features(image)
         observed = self.occupancy(features)
         self.last_observed = observed
-        if observed == self.expected(self.board):
+        costs = self.costs(features)
+        symbols = tuple(min(costs, key=lambda symbol: costs[symbol][i]) if full else None
+                        for i, full in enumerate(observed))
+
+        def matches(board):
+            if observed != self.expected(board):
+                return False
+            for i, symbol in enumerate(symbols):
+                if symbol is not None:
+                    expected = board.piece_at(self.square_at(i)).symbol()
+                    if costs[expected][i] > min(.07, costs[symbol][i] + .0015):
+                        return False
+                elif features[i][:,:,0].mean() > .08:
+                    return False
+            return True
+
+        self.last_position_matches = matches(self.board)
+        if self.last_position_matches:
             self.streak = 0
             self.last_candidate = None
             self.missed = 0
             return None
-        if observed != self.last_candidate:
-            self.last_candidate = observed
+        if symbols != self.last_candidate:
+            self.last_candidate = symbols
             self.streak = 1
+            self.missed = 0
             return None
         self.streak += 1
         if self.streak < 2:
@@ -271,9 +468,17 @@ class BoardTracker:
         # A failed animation frame must never permanently lock this position.
         if self.streak > 2 and self.streak % 3 != 2:
             return None
-        candidates = self._matching_transitions(observed, 1)
-        if not candidates:
-            candidates = self._matching_transitions(observed, 2)
+        turns = [self.board.turn]
+        if self.turn_assumed:
+            turns.append(not self.board.turn)
+        candidates = []
+        for depth in (1, 2):
+            for turn in turns:
+                candidates.extend((moves, board) for moves, board
+                                  in self._matching_transitions(observed, depth, turn)
+                                  if matches(board))
+            if candidates:
+                break
         if not candidates:
             self.missed += 1
             return Recognition(self.board.copy(), [], 'Pozisyon eşleşmedi; animasyon ya da algılama hatası. Tahtayı kontrol et.')
@@ -282,23 +487,13 @@ class BoardTracker:
         ranked = sorted((self.appearance_error(board, features), n, moves, board)
                         for n, (moves, board) in enumerate(candidates))
         best = ranked[0]
-        changed = [i for i in range(64) if self.board.piece_at(self.square_at(i)) != best[3].piece_at(self.square_at(i))]
-        for i in changed:
-            piece = best[3].piece_at(self.square_at(i))
-            if piece is None:
-                continue
-            ranked_pieces = self.ranked_pieces(features[i])
-            own = min(error for error,symbol in ranked_pieces if symbol.isupper() == piece.color)
-            opponent = min(error for error,symbol in ranked_pieces if symbol.isupper() != piece.color)
-            if opponent + .012 < own:
-                return Recognition(self.board.copy(), [], 'Taş rengi konumla uyuşmuyor; net görüntü bekleniyor.')
-        if best[0] / 64 > .035:
-            return Recognition(self.board.copy(), [], "Taş görüntüleri kalibrasyonla uyuşmuyor; net görüntü bekleniyor.")
         distinct = next((r for r in ranked[1:] if r[3].fen() != best[3].fen()), None)
         if distinct is not None and distinct[0] - best[0] < .0015:
+            self.missed += 1
             return Recognition(self.board.copy(), [], 'Görüntü belirsiz; taşların netleşmesi bekleniyor.')
-        candidates = [(best[2], best[3])]
-        moves, self.board = candidates[0]
+        moves, self.board = best[2], best[3]
+        self.last_position_matches = True
+        self.turn_assumed = False
         self.streak = 0
         self.last_candidate = None
         self.missed = 0

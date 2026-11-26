@@ -1,4 +1,4 @@
-"""Stockfish overlay with no manual FEN; tracks a standard game from move 1.
+"""Stockfish overlay for recognizing and following the visible chess position.
 
 Designed for personal analysis and permitted engine-assisted practice.
 Do not use as engine assistance in live competitive online chess.
@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt, QRect, QSettings
+from PySide6.QtCore import QTimer, Qt, QRect, QSettings, QStandardPaths
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QWidget, QLineEdit, QComboBox, QFrame, QGroupBox, QScrollArea,
 )
 
-from app import EngineSession, Analyzer, Overlay, RegionPicker
+from app import EngineSession, Analyzer, Overlay, RegionPicker, StrengthChooser, last_capture
+from piece_templates import import_reference_image
 from tracker import BoardTracker, CalibrationError
 from board_locator import BoardLocator, BoardRegion, DetectionWorker
 
@@ -55,6 +56,8 @@ class AutoWindow(QMainWindow):
         self.timer.setInterval(100)
 
         self.settings = QSettings('OverlayLab', 'StockfishOverlay')
+        data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
+        self.profile_path = Path(data_dir) / 'OverlayLab' / 'StockfishOverlay' / 'piece-theme.npz'
         self.setMinimumWidth(580)
         self.resize(640, 870)
         self.setStyleSheet("""
@@ -120,10 +123,22 @@ class AutoWindow(QMainWindow):
         row.addWidget(self.engine, 1)
         row.addWidget(browse)
         engine_card.addLayout(row)
+        options = QFormLayout()
+        self.strength = StrengthChooser()
+        saved_elo = self.settings.value('elo', 0, type=int)
+        if saved_elo and self.strength.findData(saved_elo) >= 0:
+            self.strength.setCurrentIndex(self.strength.findData(saved_elo))
+        self.strength.currentIndexChanged.connect(self.strength_changed)
+        options.addRow('Motor gücü', self.strength)
+        self.human_like = QCheckBox('İnsana benzer hamleler')
+        self.human_like.setToolTip('Yakın değerlendirmeli hamlelerde doğal gelişim ve rok gibi tercihleri öne çıkarır.')
+        self.human_like.setChecked(self.settings.value('human_like', False, type=bool))
+        self.human_like.toggled.connect(self.strength_changed)
+        options.addRow('Oyun tarzı', self.human_like)
+        engine_card.addLayout(options)
         self.black_bottom = QCheckBox('Siyah taşlar altta')
         self.black_bottom.toggled.connect(self.set_orientation)
         self.only_bottom = QCheckBox('Önerileri yalnızca benim sıramda göster')
-        self.only_bottom.setChecked(True)
         self.only_bottom.toggled.connect(self.sync_arrow_turn)
         engine_card.addWidget(self.black_bottom)
         engine_card.addWidget(self.only_bottom)
@@ -136,7 +151,7 @@ class AutoWindow(QMainWindow):
         self.seconds.setSuffix(' sn')
         row.addWidget(self.seconds)
         engine_card.addLayout(row)
-        engine_card.addWidget(label('Tahtayı başlangıç konumunda görünür tut. Alan seçmen gerekmez; yeri veya boyutu değiştiğinde yeniden bulunur.'))
+        engine_card.addWidget(label('Analiz etmek istediğin konumu ekranda açık tut. Takip bu konumdan başlar.'))
         self.start_button = QPushButton('Otomatik takibi başlat')
         self.start_button.setObjectName('primary')
         self.start_button.clicked.connect(self.start_tracking)
@@ -149,16 +164,18 @@ class AutoWindow(QMainWindow):
         engine_card.addLayout(actions)
 
         live_card = card('02  Canlı durum')
-        legend = QLabel('<span style="color:#78dca7">● En iyi hamle</span> &nbsp; '
+        legend = QLabel('<span style="color:#78dca7">● Seçilen hamle</span> &nbsp; '
                         '<span style="color:#f07883">● 2. ve 3. alternatif</span>')
         live_card.addWidget(legend)
+        self.turn_label = label('')
+        live_card.addWidget(self.turn_label)
         self.status = QLabel('Hazır. Tahtayı açıp otomatik takibi başlat.')
         self.status.setWordWrap(True)
         self.status.setMinimumHeight(56)
         live_card.addWidget(self.status)
         live_card.addWidget(label('Tahta görünmezse oklar gizlenir. Belirsiz görüntülerde son doğrulanmış konum korunur ve okuma yeniden denenir.'))
 
-        recovery = QGroupBox('Maç ortasında konumu yeniden oku')
+        recovery = QGroupBox('Konumu düzelt veya yeniden oku')
         recovery.setCheckable(True)
         recovery.setChecked(False)
         recovery_layout = QVBoxLayout(recovery)
@@ -166,9 +183,11 @@ class AutoWindow(QMainWindow):
         recovery_layout.addWidget(body)
         body_layout = QVBoxLayout(body)
         self.resync_turn = QComboBox()
-        self.resync_turn.addItems(['Beyaz oynayacak', 'Siyah oynayacak'])
-        self.castling = QLineEdit('-')
-        self.castling.setPlaceholderText('KQkq veya -')
+        self.resync_turn.addItem('Otomatik algıla', None)
+        self.resync_turn.addItem('Beyaz oynayacak', True)
+        self.resync_turn.addItem('Siyah oynayacak', False)
+        self.castling = QLineEdit()
+        self.castling.setPlaceholderText('Otomatik / KQkq / -')
         form = QFormLayout()
         form.addRow('Hamle sırası', self.resync_turn)
         form.addRow('Kalan rok hakları', self.castling)
@@ -176,38 +195,71 @@ class AutoWindow(QMainWindow):
         self.resync_button = QPushButton('Yeniden oku ve devam et')
         self.resync_button.clicked.connect(self.resync_position)
         body_layout.addWidget(self.resync_button)
-        body_layout.addWidget(label('Aynı oturumda başlangıç kalibrasyonu gerekir. Geçerken alma hakkı ve hamle geçmişi yeniden okumada sıfırlanır.'))
+        body_layout.addWidget(label('Sıra belirsizse oynayacak rengi seçip yeniden okut. Maç ortasında rok hakkı görünmez; biliyorsan buraya gir.'))
+        import_theme = QPushButton('Taş teması için örnek resim seç…')
+        import_theme.clicked.connect(self.choose_reference)
+        body_layout.addWidget(import_theme)
+        body_layout.addWidget(label('Taşlar tanınmazsa aynı temanın başlangıç dizilişini gösteren ayrı bir resim seç. Açık oyun olduğu yerde kalabilir.'))
         recovery.toggled.connect(body.setVisible)
         body.hide()
         lay.addWidget(recovery)
         lay.addStretch()
         scroll.setWidget(w)
         self.setCentralWidget(scroll)
-        self.resync_retry = False
 
-    def resync_position(self):
-        if self.tracker is None:
-            QMessageBox.warning(self, 'Kalibrasyon gerekli', 'Taş görsellerini öğrenmek için önce başlangıç konumunda bir kez kalibre et. Takip açıkken maç ortasında yeniden okutabilirsin.')
-            return
-        if not self.board_visible:
-            self.status.setText('Yeniden okumak için tahtanın bulunmasını bekle.')
-            return
-        self.resync_retry = True
-        try:
-            self.tracker.resync(self._screenshot(), self.resync_turn.currentIndex() == 0,
-                                self.castling.text().strip() or '-')
-        except (CalibrationError, ValueError) as exc:
-            self.status.setText('Yeniden okuma bekleniyor: ' + str(exc))
-            self.overlay.hide()
-            return
-        self.resync_retry = False
+    def strength_changed(self):
+        self.settings.setValue('elo', self.strength.currentData() or 0)
+        self.settings.setValue('human_like', self.human_like.isChecked())
+        self.invalidate_analysis()
+        self.request_analysis()
+
+    def invalidate_analysis(self):
         self.generation += 1
+        self.last_analyzed_fen = None
+        self.pending_analysis = self.running
         self.overlay.set_move(None)
         self.overlay.hide()
-        self.last_analyzed_fen = None
-        self.pending_analysis = True
-        self.status.setText('Mevcut tahta yeniden okundu. Takip devam ediyor; hamle geçmişi sıfırlandı.')
-        self.request_analysis()
+
+    def show_turn(self):
+        side = 'Beyaz' if self.tracker.board.turn else 'Siyah'
+        hint = ' (varsayım). Gerekirse aşağıdan hamle sırasını düzelt.' if self.tracker.turn_assumed else ''
+        self.turn_label.setText(f'Sıradaki taraf: {side}{hint}')
+
+    def read_position(self, image):
+        turn = self.resync_turn.currentData()
+        rights = self.castling.text().strip() or None
+        tracker = self.tracker
+        if tracker is not None:
+            try:
+                tracker.resync(image, turn, rights)
+            except CalibrationError:
+                # The user may have switched to a different piece set.
+                tracker = None
+        if tracker is None:
+            self.tracker = BoardTracker(image, black_bottom=self.black_bottom.isChecked(),
+                                        turn=turn, castling=rights, profile_path=self.profile_path)
+        self.resync_turn.setCurrentIndex(0)
+        self.castling.clear()
+        self.resync_retry = False
+        self.invalidate_analysis()
+        self.last_capture_ok = False
+        self.show_turn()
+        self.status.setText('Ekrandaki konum okundu. Takip sürüyor.')
+
+    def resync_position(self):
+        if not self.running or not self.board_visible:
+            self.status.setText('Tahta bulunduğunda seçtiğin ayarlarla okunacak.')
+            return
+        self.resync_retry = True
+        self.last_capture_ok = False
+        self.invalidate_analysis()
+        try:
+            image = self._screenshot()
+            if BoardLocator.confidence(image) < .88:
+                raise CalibrationError('Tahtanın görünür olması bekleniyor.')
+            self.read_position(image)
+        except (CalibrationError, ValueError) as exc:
+            self.status.setText('Yeniden okuma bekleniyor: ' + str(exc))
 
     def browse_engine(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Stockfish .exe dosyasını seç', '', 'Exe (*.exe);;Tüm dosyalar (*)')
@@ -215,12 +267,35 @@ class AutoWindow(QMainWindow):
             self.engine.setText(path)
             self.settings.setValue('engine', path)
 
+    def choose_reference(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Taş teması için örnek resim', '',
+                                              'Resimler (*.png *.jpg *.jpeg *.bmp *.webp *.gif)')
+        if not path:
+            return
+        try:
+            # Accept reference boards in either orientation, independently of the live game.
+            try:
+                import_reference_image(path, self.black_bottom.isChecked(), self.profile_path)
+            except CalibrationError:
+                import_reference_image(path, not self.black_bottom.isChecked(), self.profile_path)
+        except CalibrationError as exc:
+            self.status.setText(str(exc))
+            return
+        self.tracker = None
+        self.turn_label.clear()
+        self.last_capture_ok = False
+        self.invalidate_analysis()
+        self.status.setText('Taş teması kaydedildi. Ekrandaki konum bu temayla okunabilir.')
+
     def set_orientation(self, is_flipped):
-        if self.tracker:
-            self.stop_tracking()
-            self.status.setText('Tahta yönü değişti. Yeniden kalibre et.')
         self.overlay.black_bottom = is_flipped
         self.overlay.update()
+        if self.running:
+            self.tracker = None
+            self.turn_label.clear()
+            self.last_capture_ok = False
+            self.invalidate_analysis()
+            self.status.setText('Konum yeni tahta yönüyle okunuyor.')
 
     @staticmethod
     def _rgb(pix):
@@ -310,16 +385,14 @@ class AutoWindow(QMainWindow):
                 self.overlay.hide()
                 return
             if self.tracker is None:
-                self.tracker = BoardTracker(image, black_bottom=self.black_bottom.isChecked())
-                self.pending_analysis = True
-                self.status.setText('Tahta otomatik bulundu ve kalibre edildi. Takip sürüyor.')
+                self.read_position(image)
             elif moved:
                 self.status.setText('Tahtanın yeni konumu bulundu. Oyun takibi devam ediyor.')
             # A hidden/moved board can have advanced. Observe before restoring arrows.
             self.last_capture_ok = False
         except (CalibrationError, ValueError) as exc:
             self.overlay.hide()
-            self.status.setText('Başlangıç dizilişi bekleniyor: ' + str(exc))
+            self.status.setText(f'Konum okunuyor: {exc} Taş teması farklıysa aşağıdan örnek resim seçebilirsin.')
 
     def _screenshot(self):
         return self._capture()
@@ -348,7 +421,7 @@ class AutoWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.engine.setEnabled(False)
         self._try_capture_exclusion()
-        self.status.setText('Tahta otomatik aranıyor. Başlangıç dizilişini görünür tut.')
+        self.status.setText('Ekrandaki tahta aranıyor.')
         self.timer.start()
         self.begin_detection()
 
@@ -363,6 +436,7 @@ class AutoWindow(QMainWindow):
         self.candidate_region = None
         self.candidate_count = 0
         self.tracker = None
+        self.turn_label.clear()
         self.overlay.hide()
         self.overlay.set_move(None)
         self.engine.setEnabled(True)
@@ -407,15 +481,16 @@ class AutoWindow(QMainWindow):
                     self.resync_position()
                 return
             seen = self.tracker.observe(image)
-            self.last_capture_ok = self.tracker.last_observed == self.tracker.expected(self.tracker.board)
+            self.last_capture_ok = self.tracker.last_position_matches
             if not self.last_capture_ok:
                 self.overlay.hide()
             if seen is not None:
                 if seen.moves:
-                    self.overlay.hide()
-                    self.overlay.set_move(None)
-                    self.pending_analysis = True
+                    self.invalidate_analysis()
+                    self.show_turn()
                     self.status.setText(f'Otomatik hamle: {", ".join(seen.moves)}. İlk üç öneri hazırlanıyor.')
+                elif self.tracker.missed >= 2:
+                    self.read_position(image)
                 else:
                     self.overlay.hide()
                     self.status.setText(seen.message)
@@ -450,9 +525,12 @@ class AutoWindow(QMainWindow):
         if fen == self.last_analyzed_fen:
             self.pending_analysis = False
             return
-        self.worker = Analyzer(fen, self.engine.text().strip().strip('"'), self.seconds.value(), self.engine_session, multipv=3)
+        self.worker = Analyzer(fen, self.engine.text().strip().strip('"'), self.seconds.value(),
+                               self.engine_session, multipv=3, elo=self.strength.currentData(),
+                               human_like=self.human_like.isChecked(),
+                               last_move=last_capture(board))
         self.worker.variations.connect(lambda results, expected=fen, generation=self.generation: self.analysis_done(expected, results) if generation == self.generation else None)
-        self.worker.failure.connect(lambda error: self.status.setText('Motor hatası: ' + error))
+        self.worker.failure.connect(lambda error, gen=self.generation: self.status.setText('Motor hatası: ' + error) if gen == self.generation else None)
         self.worker.finished.connect(self.worker_finished)
         self.pending_analysis = False
         self.worker.start()
@@ -467,7 +545,9 @@ class AutoWindow(QMainWindow):
         self.overlay.set_moves([r['uci'] for r in results])
         if self.board_visible and self.last_capture_ok:
             self.overlay.show()
-        self.status.setText(' | '.join(f"{i+1}. {r['san']} ({r['score']})" for i, r in enumerate(results)))
+        suggestions = ' | '.join(f"{i+1}. {r['san']} ({r['score']})" for i, r in enumerate(results))
+        strength = self.worker.effective_strength_text
+        self.status.setText(f'{strength} · {suggestions}' if strength else suggestions)
 
     def worker_finished(self):
         if self.tracker and self.pending_analysis:
